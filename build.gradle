@@ -1,0 +1,25 @@
+plugins {
+    id 'com.android.application' version '8.2.2'
+}
+
+android {
+    namespace 'ml.toki.walkie'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'ml.toki.walkie'
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
