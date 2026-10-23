@@ -1,7 +1,21 @@
 package ml.toki.walkie;
 
 import android.Manifest;
+import android.annotation.TargetApi;
 import android.app.Activity;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.le.AdvertiseData;
+import android.bluetooth.le.AdvertisingSet;
+import android.bluetooth.le.AdvertisingSetCallback;
+import android.bluetooth.le.AdvertisingSetParameters;
+import android.bluetooth.le.BluetoothLeAdvertiser;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
+import android.bluetooth.le.ScanRecord;
+import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -17,9 +31,9 @@ import android.media.MediaRecorder;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
-import android.telephony.SmsManager;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputFilter;
-import android.text.InputType;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -41,26 +55,38 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Random;
 
-// Toki Walkie : talkie-walkie + messages en Wi-Fi local, et SMS longue distance.
+// Toki Walkie : talkie-walkie + messages en Wi-Fi local,
+// et messages texte Bluetooth longue portée (BLE Coded PHY), sans internet ni crédit.
 public class MainActivity extends Activity {
     static final int PORT = 5005, RATE = 8000, CHUNK = 640, H = 5;
     static final byte T_AUDIO = 0, T_TEXT = 1;
+    static final int MFR = 0xFFFF;          // identifiant fabricant (test) pour nos messages BLE
+    static final int BLE_MAX_BYTES = 160;   // taille max d'un message Bluetooth
     final int myId = new Random().nextInt();
 
     volatile boolean talking = false, busy = false, running = true;
     volatile DatagramSocket sock;
     Button btn;
-    TextView status, messages;
+    TextView status, messages, bleInfo;
     ScrollView scroll;
-    EditText input, phone;
+    EditText input;
     WifiManager.MulticastLock lock;
     SharedPreferences prefs;
     SharedPreferences.OnSharedPreferenceChangeListener lis;
 
-    // Enregistre un message dans l'historique (utilisé aussi par SmsReceiver)
+    // Bluetooth
+    final Handler handler = new Handler(Looper.getMainLooper());
+    final HashMap<Integer, Integer> seen = new HashMap<>();
+    boolean scanning = false;
+    int bleCounter = new Random().nextInt(60000);
+    AdvertisingSetCallback advCb;
+    BluetoothLeScanner bleScanner;
+
+    // Enregistre un message dans l'historique (utilisé aussi par SmsReceiver s'il existe encore)
     static synchronized void saveMsg(Context c, String line) {
         SharedPreferences p = c.getSharedPreferences("toki", Context.MODE_PRIVATE);
         String all = p.getString("hist", "") + line + "\n\n";
@@ -168,27 +194,15 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        phone = new EditText(this);
-        phone.setHint("Numéro (+223…) pour SMS longue distance");
-        phone.setHintTextColor(Color.GRAY);
-        phone.setTextColor(Color.WHITE);
-        phone.setInputType(InputType.TYPE_CLASS_PHONE);
-        phone.setSingleLine(true);
-        phone.setText(prefs.getString("num", ""));
+        Button ble = new Button(this);
+        ble.setText("Bluetooth longue portée");
+        ble.setTextColor(Color.WHITE);
+        ble.setBackgroundColor(Color.rgb(106, 27, 154));
 
-        Button sms = new Button(this);
-        sms.setText("SMS");
-        sms.setTextColor(Color.WHITE);
-        sms.setBackgroundColor(Color.rgb(230, 81, 0));
-
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        row2.setGravity(Gravity.CENTER_VERTICAL);
-        row2.addView(phone, new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        row2.addView(sms, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        bleInfo = new TextView(this);
+        bleInfo.setTextColor(Color.GRAY);
+        bleInfo.setTextSize(13);
+        bleInfo.setGravity(Gravity.CENTER);
 
         LinearLayout.LayoutParams full = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -203,10 +217,11 @@ public class MainActivity extends Activity {
         root.addView(status, full);
         root.addView(scroll, scrollLp);
         root.addView(row1, full);
-        root.addView(row2, full);
+        root.addView(ble, full);
+        root.addView(bleInfo, full);
         setContentView(root);
 
-        // Met à jour l'écran quand l'historique change (Wi-Fi ou SMS reçu)
+        // Met à jour l'écran quand l'historique change
         lis = (p, key) -> {
             if ("hist".equals(key)) refresh();
         };
@@ -226,18 +241,13 @@ public class MainActivity extends Activity {
             input.setText("");
         });
 
-        sms.setOnClickListener(v -> {
+        ble.setOnClickListener(v -> {
             String t = input.getText().toString().trim();
-            String num = phone.getText().toString().trim();
             if (t.isEmpty()) {
                 status.setText("Écris d'abord un message");
                 return;
             }
-            if (num.length() < 6) {
-                status.setText("Entre un numéro, ex. +223…");
-                return;
-            }
-            sendSms(num, t);
+            if (sendBle(t)) input.setText("");
         });
 
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -247,6 +257,7 @@ public class MainActivity extends Activity {
         }
 
         new Thread(this::recvLoop).start();
+        ensureBle();
     }
 
     void refresh() {
@@ -260,32 +271,228 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> status.setText(t));
     }
 
+    void info(String t) {
+        runOnUiThread(() -> bleInfo.setText(t));
+    }
+
     void addMsg(String line) {
         saveMsg(this, line);
     }
 
-    void sendSms(String num, String t) {
-        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED
-                || checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.SEND_SMS,
-                    Manifest.permission.RECEIVE_SMS}, 2);
-            status.setText("Autorise les SMS, puis réessaie");
+    // ---------------- Bluetooth longue portée (BLE Coded PHY) ----------------
+
+    String[] blePerms() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            return new String[]{"android.permission.BLUETOOTH_SCAN",
+                    "android.permission.BLUETOOTH_ADVERTISE",
+                    "android.permission.BLUETOOTH_CONNECT"};
+        }
+        return new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+    }
+
+    boolean hasBlePerms() {
+        for (String p : blePerms()) {
+            if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) return false;
+        }
+        return true;
+    }
+
+    void ensureBle() {
+        if (Build.VERSION.SDK_INT < 26) {
+            info("Bluetooth longue portée : Android trop ancien");
+            return;
+        }
+        if (!hasBlePerms()) {
+            requestPermissions(blePerms(), 3);
+            return;
+        }
+        startBleScan();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+        super.onRequestPermissionsResult(code, perms, res);
+        if (code == 3) {
+            if (hasBlePerms()) startBleScan();
+            else info("Autorise le Bluetooth pour les messages longue portée");
+        }
+    }
+
+    final ScanCallback scanCb = new ScanCallback() {
+        @Override
+        public void onScanResult(int type, ScanResult r) {
+            handleBle(r);
+        }
+
+        @Override
+        public void onBatchScanResults(List<ScanResult> list) {
+            for (ScanResult r : list) handleBle(r);
+        }
+
+        @Override
+        public void onScanFailed(int code) {
+            scanning = false;
+            info("Échec du scan Bluetooth (code " + code + ")");
+        }
+    };
+
+    @TargetApi(26)
+    void startBleScan() {
+        if (scanning) return;
+        BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+        if (ad == null || !ad.isEnabled()) {
+            info("Bluetooth éteint : active-le puis relance l'appli");
+            return;
+        }
+        if (!ad.isLeCodedPhySupported() || !ad.isLeExtendedAdvertisingSupported()) {
+            info("Ce téléphone ne supporte pas le Bluetooth longue portée");
+            return;
+        }
+        BluetoothLeScanner sc = ad.getBluetoothLeScanner();
+        if (sc == null) {
+            info("Scanner Bluetooth indisponible");
             return;
         }
         try {
-            SmsManager sm = Build.VERSION.SDK_INT >= 31
-                    ? getSystemService(SmsManager.class)
-                    : SmsManager.getDefault();
-            ArrayList<String> parts = sm.divideMessage("TW:" + t);
-            sm.sendMultipartTextMessage(num, null, parts, null, null);
-            prefs.edit().putString("num", num).apply();
-            addMsg("Moi (SMS à " + num + ") : " + t);
-            input.setText("");
-            status.setText("SMS envoyé");
+            ScanFilter f = new ScanFilter.Builder()
+                    .setManufacturerData(MFR, new byte[]{'T', 'W'},
+                            new byte[]{(byte) 0xFF, (byte) 0xFF})
+                    .build();
+            ScanSettings st = new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .setLegacy(false)
+                    .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+                    .build();
+            sc.startScan(Collections.singletonList(f), st, scanCb);
+            bleScanner = sc;
+            scanning = true;
+            info("Bluetooth longue portée : prêt (texte seulement)");
         } catch (Exception e) {
-            status.setText("Échec de l'envoi du SMS");
+            info("Erreur Bluetooth (scan)");
         }
     }
+
+    void stopBleScan() {
+        if (!scanning) return;
+        try {
+            if (bleScanner != null) bleScanner.stopScan(scanCb);
+        } catch (Exception e) {
+            // ignoré
+        }
+        scanning = false;
+    }
+
+    void handleBle(ScanResult r) {
+        ScanRecord sr = r.getScanRecord();
+        if (sr == null) return;
+        byte[] d = sr.getManufacturerSpecificData(MFR);
+        if (d == null || d.length < 9 || d[0] != 'T' || d[1] != 'W') return;
+        int id = ByteBuffer.wrap(d, 2, 4).getInt();
+        int cnt = ((d[6] & 0xFF) << 8) | (d[7] & 0xFF);
+        if (id == myId) return;
+        synchronized (seen) {
+            Integer last = seen.get(id);
+            if (last != null && last == cnt) return; // même message, déjà reçu
+            seen.put(id, cnt);
+        }
+        String msg = new String(d, 8, d.length - 8, StandardCharsets.UTF_8);
+        addMsg("Bluetooth : " + msg);
+    }
+
+    // Retourne true si le message est parti
+    @TargetApi(26)
+    boolean sendBle(String t) {
+        if (Build.VERSION.SDK_INT < 26) {
+            status.setText("Bluetooth longue portée : Android trop ancien");
+            return false;
+        }
+        if (!hasBlePerms()) {
+            ensureBle();
+            status.setText("Autorise le Bluetooth, puis réessaie");
+            return false;
+        }
+        BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+        if (ad == null || !ad.isEnabled()) {
+            status.setText("Active le Bluetooth, puis réessaie");
+            return false;
+        }
+        if (!ad.isLeCodedPhySupported() || !ad.isLeExtendedAdvertisingSupported()) {
+            status.setText("Téléphone non compatible Bluetooth longue portée");
+            return false;
+        }
+        final BluetoothLeAdvertiser adv = ad.getBluetoothLeAdvertiser();
+        if (adv == null) {
+            status.setText("Bluetooth indisponible");
+            return false;
+        }
+        byte[] txt = t.getBytes(StandardCharsets.UTF_8);
+        if (txt.length > BLE_MAX_BYTES || txt.length + 12 > ad.getLeMaximumAdvertisingDataLength()) {
+            status.setText("Message trop long pour le Bluetooth (max " + BLE_MAX_BYTES + " octets)");
+            return false;
+        }
+        try {
+            // arrête l'envoi précédent
+            if (advCb != null) {
+                try {
+                    adv.stopAdvertisingSet(advCb);
+                } catch (Exception e) {
+                    // ignoré
+                }
+            }
+            bleCounter = (bleCounter + 1) & 0xFFFF;
+            byte[] pl = new byte[8 + txt.length];
+            pl[0] = 'T';
+            pl[1] = 'W';
+            ByteBuffer.wrap(pl).putInt(2, myId);
+            pl[6] = (byte) (bleCounter >> 8);
+            pl[7] = (byte) bleCounter;
+            System.arraycopy(txt, 0, pl, 8, txt.length);
+
+            AdvertisingSetParameters params = new AdvertisingSetParameters.Builder()
+                    .setLegacyMode(false)
+                    .setConnectable(false)
+                    .setScannable(false)
+                    .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
+                    .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_HIGH)
+                    .setPrimaryPhy(BluetoothDevice.PHY_LE_CODED)
+                    .setSecondaryPhy(BluetoothDevice.PHY_LE_CODED)
+                    .build();
+            AdvertiseData data = new AdvertiseData.Builder()
+                    .setIncludeDeviceName(false)
+                    .setIncludeTxPowerLevel(false)
+                    .addManufacturerData(MFR, pl)
+                    .build();
+
+            final AdvertisingSetCallback cb = new AdvertisingSetCallback() {
+                @Override
+                public void onAdvertisingSetStarted(AdvertisingSet set, int txPower, int st) {
+                    if (st == AdvertisingSetCallback.ADVERTISE_SUCCESS) {
+                        ui("Message envoyé en Bluetooth");
+                    } else {
+                        ui("Échec de l'envoi Bluetooth (code " + st + ")");
+                    }
+                }
+            };
+            advCb = cb;
+            adv.startAdvertisingSet(params, data, null, null, null, cb);
+            addMsg("Moi (Bluetooth) : " + t);
+
+            // diffuse pendant 8 secondes puis s'arrête
+            handler.postDelayed(() -> {
+                try {
+                    adv.stopAdvertisingSet(cb);
+                } catch (Exception e) {
+                    // ignoré
+                }
+            }, 8000);
+            return true;
+        } catch (Exception e) {
+            status.setText("Erreur d'envoi Bluetooth");
+            return false;
+        }
+    }
+
+    // ---------------- Voix et texte Wi-Fi (inchangé) ----------------
 
     void startTalk() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -435,6 +642,7 @@ public class MainActivity extends Activity {
         super.onResume();
         refresh();
         prefs.registerOnSharedPreferenceChangeListener(lis);
+        if (Build.VERSION.SDK_INT >= 26 && hasBlePerms()) startBleScan();
     }
 
     @Override
@@ -442,6 +650,7 @@ public class MainActivity extends Activity {
         super.onPause();
         talking = false;
         prefs.unregisterOnSharedPreferenceChangeListener(lis);
+        stopBleScan();
     }
 
     @Override
@@ -449,7 +658,8 @@ public class MainActivity extends Activity {
         super.onDestroy();
         running = false;
         talking = false;
+        stopBleScan();
         if (sock != null) sock.close();
         if (lock != null && lock.isHeld()) lock.release();
     }
-    }
+}
