@@ -3,6 +3,7 @@ package ml.toki.walkie;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -14,8 +15,11 @@ import android.media.AudioRecord;
 import android.media.AudioTrack;
 import android.media.MediaRecorder;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.telephony.SmsManager;
 import android.text.InputFilter;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -40,7 +44,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 
-// Toki Walkie : talkie-walkie + messages texte en Wi-Fi local, sans internet.
+// Toki Walkie : talkie-walkie + messages en Wi-Fi local, et SMS longue distance.
 public class MainActivity extends Activity {
     static final int PORT = 5005, RATE = 8000, CHUNK = 640, H = 5;
     static final byte T_AUDIO = 0, T_TEXT = 1;
@@ -51,8 +55,18 @@ public class MainActivity extends Activity {
     Button btn;
     TextView status, messages;
     ScrollView scroll;
-    EditText input;
+    EditText input, phone;
     WifiManager.MulticastLock lock;
+    SharedPreferences prefs;
+    SharedPreferences.OnSharedPreferenceChangeListener lis;
+
+    // Enregistre un message dans l'historique (utilisé aussi par SmsReceiver)
+    static synchronized void saveMsg(Context c, String line) {
+        SharedPreferences p = c.getSharedPreferences("toki", Context.MODE_PRIVATE);
+        String all = p.getString("hist", "") + line + "\n\n";
+        if (all.length() > 20000) all = all.substring(all.length() - 20000);
+        p.edit().putString("hist", all).apply();
+    }
 
     // Logo : un talkie-walkie dessiné en code
     class LogoView extends View {
@@ -90,9 +104,10 @@ public class MainActivity extends Activity {
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        prefs = getSharedPreferences("toki", MODE_PRIVATE);
 
         float d = getResources().getDisplayMetrics().density;
-        int pad = (int) (12 * d);
+        int pad = (int) (10 * d);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -101,31 +116,31 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad * 2, pad, pad);
 
         LogoView logo = new LogoView(this);
-        int ls = (int) (70 * d);
+        int ls = (int) (60 * d);
 
         TextView title = new TextView(this);
         title.setText("Toki Walkie");
         title.setTextColor(Color.WHITE);
-        title.setTextSize(24);
+        title.setTextSize(22);
         title.setGravity(Gravity.CENTER);
 
         btn = new Button(this);
         btn.setText("Maintiens pour parler");
-        btn.setTextSize(18);
+        btn.setTextSize(16);
         btn.setTextColor(Color.WHITE);
         btn.setBackgroundColor(Color.rgb(46, 125, 50));
-        int s = (int) (170 * d);
+        int s = (int) (140 * d);
 
         status = new TextView(this);
         status.setText("Connexion…");
         status.setTextColor(Color.LTGRAY);
-        status.setTextSize(16);
+        status.setTextSize(15);
         status.setGravity(Gravity.CENTER);
         status.setPadding(0, pad, 0, pad);
 
         messages = new TextView(this);
         messages.setTextColor(Color.WHITE);
-        messages.setTextSize(16);
+        messages.setTextSize(15);
         messages.setPadding(pad, pad, pad, pad);
 
         scroll = new ScrollView(this);
@@ -140,16 +155,38 @@ public class MainActivity extends Activity {
         input.setFilters(new InputFilter[]{new InputFilter.LengthFilter(300)});
 
         Button send = new Button(this);
-        send.setText("Envoyer");
+        send.setText("Wi-Fi");
         send.setTextColor(Color.WHITE);
         send.setBackgroundColor(Color.rgb(25, 118, 210));
 
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.addView(input, new LinearLayout.LayoutParams(0,
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        row1.setGravity(Gravity.CENTER_VERTICAL);
+        row1.addView(input, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        row.addView(send, new LinearLayout.LayoutParams(
+        row1.addView(send, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        phone = new EditText(this);
+        phone.setHint("Numéro (+223…) pour SMS longue distance");
+        phone.setHintTextColor(Color.GRAY);
+        phone.setTextColor(Color.WHITE);
+        phone.setInputType(InputType.TYPE_CLASS_PHONE);
+        phone.setSingleLine(true);
+        phone.setText(prefs.getString("num", ""));
+
+        Button sms = new Button(this);
+        sms.setText("SMS");
+        sms.setTextColor(Color.WHITE);
+        sms.setBackgroundColor(Color.rgb(230, 81, 0));
+
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.setGravity(Gravity.CENTER_VERTICAL);
+        row2.addView(phone, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row2.addView(sms, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
@@ -165,8 +202,14 @@ public class MainActivity extends Activity {
         root.addView(btn, new LinearLayout.LayoutParams(s, s));
         root.addView(status, full);
         root.addView(scroll, scrollLp);
-        root.addView(row, full);
+        root.addView(row1, full);
+        root.addView(row2, full);
         setContentView(root);
+
+        // Met à jour l'écran quand l'historique change (Wi-Fi ou SMS reçu)
+        lis = (p, key) -> {
+            if ("hist".equals(key)) refresh();
+        };
 
         btn.setOnTouchListener((v, e) -> {
             int a = e.getActionMasked();
@@ -179,8 +222,22 @@ public class MainActivity extends Activity {
             String t = input.getText().toString().trim();
             if (t.isEmpty()) return;
             sendText(t);
-            addMsg("Moi : " + t);
+            addMsg("Moi (Wi-Fi) : " + t);
             input.setText("");
+        });
+
+        sms.setOnClickListener(v -> {
+            String t = input.getText().toString().trim();
+            String num = phone.getText().toString().trim();
+            if (t.isEmpty()) {
+                status.setText("Écris d'abord un message");
+                return;
+            }
+            if (num.length() < 6) {
+                status.setText("Entre un numéro, ex. +223…");
+                return;
+            }
+            sendSms(num, t);
         });
 
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -192,15 +249,42 @@ public class MainActivity extends Activity {
         new Thread(this::recvLoop).start();
     }
 
+    void refresh() {
+        runOnUiThread(() -> {
+            messages.setText(prefs.getString("hist", ""));
+            scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+        });
+    }
+
     void ui(String t) {
         runOnUiThread(() -> status.setText(t));
     }
 
     void addMsg(String line) {
-        runOnUiThread(() -> {
-            messages.append(line + "\n\n");
-            scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
-        });
+        saveMsg(this, line);
+    }
+
+    void sendSms(String num, String t) {
+        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED
+                || checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.SEND_SMS,
+                    Manifest.permission.RECEIVE_SMS}, 2);
+            status.setText("Autorise les SMS, puis réessaie");
+            return;
+        }
+        try {
+            SmsManager sm = Build.VERSION.SDK_INT >= 31
+                    ? getSystemService(SmsManager.class)
+                    : SmsManager.getDefault();
+            ArrayList<String> parts = sm.divideMessage("TW:" + t);
+            sm.sendMultipartTextMessage(num, null, parts, null, null);
+            prefs.edit().putString("num", num).apply();
+            addMsg("Moi (SMS à " + num + ") : " + t);
+            input.setText("");
+            status.setText("SMS envoyé");
+        } catch (Exception e) {
+            status.setText("Échec de l'envoi du SMS");
+        }
     }
 
     void startTalk() {
@@ -238,7 +322,7 @@ public class MainActivity extends Activity {
         return l;
     }
 
-    // Envoi d'un message texte (sur un thread, car le réseau est interdit sur le thread principal)
+    // Message texte en Wi-Fi local (sur un thread : réseau interdit sur le thread principal)
     void sendText(final String t) {
         new Thread(() -> {
             if (sock == null) {
@@ -326,7 +410,7 @@ public class MainActivity extends Activity {
                 byte type = buf[4];
                 if (type == T_TEXT) {
                     String msg = new String(buf, H, len - H, StandardCharsets.UTF_8);
-                    addMsg("Autre : " + msg);
+                    addMsg("Wi-Fi : " + msg);
                 } else {
                     track.write(buf, H, len - H);
                     if (!receiving) {
@@ -347,9 +431,17 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        refresh();
+        prefs.registerOnSharedPreferenceChangeListener(lis);
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         talking = false;
+        prefs.unregisterOnSharedPreferenceChangeListener(lis);
     }
 
     @Override
