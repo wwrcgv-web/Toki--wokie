@@ -15,10 +15,8 @@ public class MainActivity extends Activity {
         textView.setTextSize(16);
 
         try {
-            // Test d'affichage simple
             textView.setText("Toki Walkie démarre correctement !");
         } catch (Throwable t) {
-            // Affiche l'erreur exacte sur l'écran si ça plante
             textView.setText("Erreur détectée :\n\n" + t.toString());
         }
 
