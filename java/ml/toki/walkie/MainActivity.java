@@ -17,14 +17,14 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Demande de permission micro au démarrage
+        // Demande la permission du micro au démarrage
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO_PERMISSION);
             }
         }
 
-        // Création de l'interface visuelle
+        // Création de la mise en page
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(32, 32, 32, 32);
@@ -38,7 +38,7 @@ public class MainActivity extends Activity {
         talkButton.setText("APPUYER POUR PARLER");
         talkButton.setTextSize(18);
 
-        // Action quand on appuie sur le bouton
+        // Action quand on clique sur le bouton
         talkButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
