@@ -45,57 +45,69 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        setVolumeControlStream(AudioManager.STREAM_MUSIC);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        try {
+            setVolumeControlStream(AudioManager.STREAM_MUSIC);
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER);
-        root.setBackgroundColor(Color.rgb(17, 17, 17));
+            LinearLayout root = new LinearLayout(this);
+            root.setOrientation(LinearLayout.VERTICAL);
+            root.setGravity(Gravity.CENTER);
+            root.setBackgroundColor(Color.rgb(17, 17, 17));
 
-        TextView title = new TextView(this);
-        title.setText("Toki Walkie");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(28);
-        title.setPadding(0, 0, 0, 48);
+            TextView title = new TextView(this);
+            title.setText("Toki Walkie");
+            title.setTextColor(Color.WHITE);
+            title.setTextSize(28);
+            title.setPadding(0, 0, 0, 48);
 
-        btn = new Button(this);
-        btn.setText("Maintiens pour parler");
-        btn.setTextSize(20);
-        btn.setTextColor(Color.WHITE);
-        btn.setBackgroundColor(Color.rgb(46, 125, 50));
-        int s = (int) (240 * getResources().getDisplayMetrics().density);
+            btn = new Button(this);
+            btn.setText("Maintiens pour parler");
+            btn.setTextSize(20);
+            btn.setTextColor(Color.WHITE);
+            btn.setBackgroundColor(Color.rgb(46, 125, 50));
+            int s = (int) (240 * getResources().getDisplayMetrics().density);
 
-        status = new TextView(this);
-        status.setText("Connexion…");
-        status.setTextColor(Color.LTGRAY);
-        status.setTextSize(18);
-        status.setPadding(0, 48, 0, 0);
+            status = new TextView(this);
+            status.setText("Démarrage…");
+            status.setTextColor(Color.LTGRAY);
+            status.setTextSize(18);
+            status.setPadding(0, 48, 0, 0);
 
-        root.addView(title);
-        root.addView(btn, new LinearLayout.LayoutParams(s, s));
-        root.addView(status);
-        setContentView(root);
+            root.addView(title);
+            root.addView(btn, new LinearLayout.LayoutParams(s, s));
+            root.addView(status);
+            setContentView(root);
 
-        btn.setOnTouchListener((v, e) -> {
-            int a = e.getActionMasked();
-            if (a == MotionEvent.ACTION_DOWN) startTalk();
-            else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) stopTalk();
-            return true;
-        });
+            btn.setOnTouchListener((v, e) -> {
+                int a = e.getActionMasked();
+                if (a == MotionEvent.ACTION_DOWN) startTalk();
+                else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) stopTalk();
+                return true;
+            });
 
-        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm != null) {
-            lock = wm.createMulticastLock("toki");
-            lock.acquire();
+            try {
+                WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wm != null) {
+                    lock = wm.createMulticastLock("toki");
+                    lock.acquire();
+                }
+            } catch (Exception e) {
+                // Ignoré si le wifi pose souci
+            }
+
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            }
+
+            new Thread(this::recvLoop).start();
+
+        } catch (Exception e) {
+            // En cas de crash, on l'affiche à l'écran au lieu de fermer l'appli
+            TextView errView = new TextView(this);
+            errView.setText("Erreur init: " + e.getMessage());
+            errView.setTextColor(Color.RED);
+            setContentView(errView);
         }
-
-        // Demande de la permission micro dès le lancement si elle manque
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
-        }
-
-        new Thread(this::recvLoop).start();
     }
 
     void ui(String t) {
