@@ -80,7 +80,7 @@ public class MainActivity extends Activity {
     static final byte T_AUDIO = 0, T_TEXT = 1;
     static final int MFR = 0xFFFF;          // identifiant fabricant (test) pour nos messages BLE
     static final int BLE_MAX_BYTES = 160;   // taille max d'un message Bluetooth
-    static final String ADMIN_CODE = "Toki-4821"; // <-- mets ton code administrateur ici
+    static final String ADMIN_CODE = "toki-4821"; // <-- mets ton code administrateur ici
     static final int APP_BUILD = 0; // remplacé automatiquement par GitHub à chaque construction
     static final String REPO = "wwrcgv-web/Toki--wokie"; // <-- vérifie : compte/projet GitHub
     static final int LEG_TEXT = 16;         // octets de texte par morceau (mode normal)
@@ -88,7 +88,7 @@ public class MainActivity extends Activity {
 
     volatile boolean talking = false, busy = false, running = true;
     volatile DatagramSocket sock;
-    Button btn;
+    MicButton btn;
     TextView status, messages, bleInfo;
     ScrollView scroll;
     EditText input;
@@ -152,6 +152,46 @@ public class MainActivity extends Activity {
         }
     }
 
+    // Bouton micro : rond, avec une icône de micro dessinée en code
+    class MicButton extends View {
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        int col = Color.rgb(46, 125, 50);
+
+        MicButton(Context c) {
+            super(c);
+        }
+
+        @Override
+        public void setBackgroundColor(int c) {
+            col = c;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight();
+            float u = Math.min(w, h) / 100f;
+            float cx = w / 2, cy = h / 2;
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(col);
+            c.drawCircle(cx, cy, 48 * u, p);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(2 * u);
+            p.setColor(Color.argb(70, 255, 255, 255));
+            c.drawCircle(cx, cy, 43 * u, p);
+
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(Color.WHITE);
+            c.drawRoundRect(new RectF(cx - 9 * u, cy - 28 * u, cx + 9 * u, cy + 6 * u), 9 * u, 9 * u, p);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(4 * u);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            c.drawArc(new RectF(cx - 17 * u, cy - 16 * u, cx + 17 * u, cy + 18 * u), 0, 180, false, p);
+            c.drawLine(cx, cy + 18 * u, cx, cy + 28 * u, p);
+            c.drawLine(cx - 9 * u, cy + 28 * u, cx + 9 * u, cy + 28 * u, p);
+        }
+    }
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -210,12 +250,24 @@ public class MainActivity extends Activity {
         who.setText(myName.isEmpty() ? "Choisis ton nom" : "Moi : " + myName + " (touche pour changer)");
         who.setOnClickListener(v -> askName(false));
 
-        btn = new Button(this);
-        btn.setText("Maintiens pour parler");
-        btn.setTextSize(16);
-        btn.setTextColor(Color.WHITE);
+        btn = new MicButton(this);
         btn.setBackgroundColor(Color.rgb(46, 125, 50));
-        int s = (int) (140 * d);
+        int s = (int) (96 * d);
+
+        TextView hint = new TextView(this);
+        hint.setText("Maintiens le micro pour parler");
+        hint.setTextColor(Color.GRAY);
+        hint.setTextSize(12);
+        hint.setGravity(Gravity.CENTER);
+        hint.setPadding(0, pad / 2, 0, 0);
+
+        TextView settings = new TextView(this);
+        settings.setText("\u2699  Paramètres");
+        settings.setTextColor(Color.LTGRAY);
+        settings.setTextSize(15);
+        settings.setGravity(Gravity.END);
+        settings.setPadding(pad, pad / 2, pad, pad / 2);
+        settings.setOnClickListener(v -> openSettings());
 
         status = new TextView(this);
         status.setText("Connexion…");
@@ -273,10 +325,12 @@ public class MainActivity extends Activity {
 
         root.addView(banner, 0, full);
         root.addView(updateBar, 0, full);
+        root.addView(settings, 0, full);
         root.addView(logo, new LinearLayout.LayoutParams(ls, ls));
         root.addView(title, full);
         root.addView(who, full);
         root.addView(btn, new LinearLayout.LayoutParams(s, s));
+        root.addView(hint, full);
         root.addView(status, full);
         root.addView(scroll, scrollLp);
         root.addView(row1, full);
@@ -322,7 +376,7 @@ public class MainActivity extends Activity {
         new Thread(this::recvLoop).start();
         ensureBle();
         if (myName.isEmpty()) askName(true);
-        checkUpdate();
+        checkUpdate(false);
     }
 
     // ---------------- Profil local (nom choisi sur le téléphone) ----------------
@@ -417,7 +471,7 @@ public class MainActivity extends Activity {
 
     // ---------------- Mise à jour proposée (via les Releases GitHub) ----------------
 
-    void checkUpdate() {
+    void checkUpdate(final boolean manual) {
         new Thread(() -> {
             try {
                 HttpURLConnection c = (HttpURLConnection) new URL(
@@ -426,7 +480,10 @@ public class MainActivity extends Activity {
                 c.setReadTimeout(6000);
                 c.setRequestProperty("Accept", "application/vnd.github+json");
                 c.setRequestProperty("User-Agent", "TokiWalkie");
-                if (c.getResponseCode() != 200) return;
+                if (c.getResponseCode() != 200) {
+                    if (manual) ui("Aucune version publiée pour le moment");
+                    return;
+                }
                 ByteArrayOutputStream bo = new ByteArrayOutputStream();
                 InputStream in = c.getInputStream();
                 byte[] b = new byte[4096];
@@ -435,7 +492,10 @@ public class MainActivity extends Activity {
                 in.close();
                 JSONObject j = new JSONObject(new String(bo.toByteArray(), StandardCharsets.UTF_8));
                 int latest = Integer.parseInt(j.optString("tag_name", "").replaceAll("[^0-9]", ""));
-                if (latest <= APP_BUILD) return;
+                if (latest <= APP_BUILD) {
+                    if (manual) ui("Tu as déjà la dernière version");
+                    return;
+                }
                 String url = j.optString("html_url", "");
                 JSONArray as = j.optJSONArray("assets");
                 if (as != null && as.length() > 0) {
@@ -450,9 +510,58 @@ public class MainActivity extends Activity {
                     updateBar.setVisibility(View.VISIBLE);
                 });
             } catch (Exception e) {
-                // pas d'internet ou pas de Release : on ne fait rien
+                if (manual) ui("Impossible de vérifier (pas d'internet ?)");
             }
         }).start();
+    }
+
+    // ---------------- Paramètres ----------------
+
+    void openSettings() {
+        final String[] items = {
+                "Changer mon nom",
+                "Envoyer une annonce (administrateur)",
+                "Relancer le Bluetooth",
+                "Rechercher une mise à jour",
+                "Effacer l'historique des messages",
+                "À propos"};
+        new AlertDialog.Builder(this)
+                .setTitle("Paramètres")
+                .setItems(items, (dlg, i) -> {
+                    if (i == 0) askName(false);
+                    else if (i == 1) askAdmin();
+                    else if (i == 2) {
+                        stopBleScan();
+                        ensureBle();
+                    } else if (i == 3) checkUpdate(true);
+                    else if (i == 4) confirmClear();
+                    else showAbout();
+                })
+                .setNegativeButton("Fermer", null)
+                .show();
+    }
+
+    void confirmClear() {
+        new AlertDialog.Builder(this)
+                .setTitle("Effacer l'historique ?")
+                .setMessage("Tous les messages affichés seront supprimés de ce téléphone.")
+                .setPositiveButton("Effacer", (dlg, w) -> {
+                    prefs.edit().remove("hist").apply();
+                    refresh();
+                })
+                .setNegativeButton("Annuler", null)
+                .show();
+    }
+
+    void showAbout() {
+        new AlertDialog.Builder(this)
+                .setTitle("Toki Walkie")
+                .setMessage("Version " + APP_BUILD
+                        + "\n\nVoix et messages en Wi-Fi local, messages texte en Bluetooth."
+                        + "\nFonctionne sans internet ni crédit."
+                        + "\n\nNom : " + (myName.isEmpty() ? "non choisi" : myName))
+                .setPositiveButton("OK", null)
+                .show();
     }
 
     void refresh() {
