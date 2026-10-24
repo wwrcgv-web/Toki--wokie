@@ -2,6 +2,9 @@ name: Build APK
 
 on: [push]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,6 +17,8 @@ jobs:
           java-version: '17'
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+      - name: Numéro de version dans le code
+        run: sed -i "s/APP_BUILD = 0/APP_BUILD = ${{ github.run_number }}/" $(find . -name MainActivity.java)
       - name: Build with Gradle
         run: gradle assembleDebug
       - name: Upload APK
@@ -21,3 +26,9 @@ jobs:
         with:
           name: app-debug
           path: '**/*.apk'
+      - name: Publier la Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Toki Walkie ${{ github.run_number }}
+          files: '**/*.apk'
