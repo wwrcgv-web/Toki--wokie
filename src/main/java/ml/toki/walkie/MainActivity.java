@@ -26,6 +26,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.RectF;
@@ -40,7 +41,10 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
+import android.text.Editable;
 import android.text.InputFilter;
+import android.text.TextWatcher;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -86,7 +90,8 @@ public class MainActivity extends Activity {
     // Couleurs de l'interface
     static final int C_BG = 0xFF0B1220, C_CARD = 0xFF151F30, C_TEXT = 0xFFF8FAFC,
             C_GREEN = 0xFF22C55E, C_MUTED = 0xFF94A3B8, C_RED = 0xFFEF4444,
-            C_BLUE = 0xFF3B82F6, C_AMBER = 0xFFF59E0B;
+            C_BLUE = 0xFF3B82F6, C_AMBER = 0xFFF59E0B,
+            C_STROKE = 0xFF223049, C_GRAY = 0xFF475569;
     static final String STATE_READY = "Prêt", STATE_DOWN = "Connexion interrompue";
     static final int MFR = 0xFFFF;          // identifiant fabricant (test) pour nos messages BLE
     static final int BLE_MAX_BYTES = 160;   // taille max d'un message Bluetooth
@@ -124,6 +129,12 @@ public class MainActivity extends Activity {
     final HashMap<Integer, Long> wifiPeers = new HashMap<>();
     final HashMap<Integer, Long> btPeers = new HashMap<>();
     int tickN = 0;
+    long wifiSince = 0, lastSend = 0;
+    boolean micDenied = false;
+    int lastCount = -1;
+    Button sendBtn;
+    String pendShown = null;
+    final Object pendLock = new Object();
     final Runnable tick = new Runnable() {
         @Override
         public void run() {
@@ -197,8 +208,8 @@ public class MainActivity extends Activity {
             float w = getWidth(), h = getHeight();
             float u = Math.min(w, h) / 100f;
             float cx = w / 2, cy = h / 2;
-            int col = mode == 1 ? C_RED : (mode == 2 ? C_BLUE : C_GREEN);
-            if (mode != 0) {
+            int col = mode == 1 ? C_RED : (mode == 2 ? C_BLUE : (mode == 3 ? C_GRAY : C_GREEN));
+            if (mode == 1 || mode == 2) {
                 float t = (System.currentTimeMillis() % 1400) / 1400f;
                 p.setStyle(Paint.Style.STROKE);
                 p.setStrokeWidth(3 * u);
@@ -314,7 +325,7 @@ public class MainActivity extends Activity {
         // Carte « Connexion »
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(rounded(C_CARD, 16));
+        card.setBackground(rounded(C_CARD, 16, C_STROKE));
         card.setPadding(dp(14), dp(12), dp(14), dp(12));
 
         TextView cardTitle = new TextView(this);
@@ -397,8 +408,11 @@ public class MainActivity extends Activity {
         input.setHintTextColor(C_MUTED);
         input.setTextColor(C_TEXT);
         input.setTextSize(15);
-        input.setMaxLines(3);
-        input.setBackground(rounded(C_CARD, 22));
+        input.setMaxLines(4);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        input.setGravity(Gravity.CENTER_VERTICAL);
+        input.setBackground(rounded(C_CARD, 22, C_STROKE));
         input.setPadding(dp(16), dp(10), dp(16), dp(10));
         input.setFilters(new InputFilter[]{new InputFilter.LengthFilter(300)});
 
@@ -408,6 +422,7 @@ public class MainActivity extends Activity {
         send.setTextColor(C_BG);
         send.setTypeface(null, Typeface.BOLD);
         send.setBackground(rounded(C_GREEN, 22));
+        sendBtn = send;
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -440,18 +455,45 @@ public class MainActivity extends Activity {
             return true;
         });
 
+        input.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence cs, int st, int bf, int ct) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence cs, int st, int bf, int ct) {
+                updateSendEnabled();
+            }
+
+            @Override
+            public void afterTextChanged(Editable ed) {
+            }
+        });
+        updateSendEnabled();
+
         send.setOnClickListener(v -> {
             String t = input.getText().toString().trim();
-            if (t.isEmpty()) {
-                status.setText("Écris d'abord un message");
-                return;
-            }
+            if (t.isEmpty()) return;
+            long now = System.currentTimeMillis();
+            if (now - lastSend < 800) return; // évite les doubles envois
+            lastSend = now;
             if (mode == 0) {
-                sendText(t);
-                addMsg("Moi (Wi-Fi) : " + t);
+                sendTextMsg(t);
                 input.setText("");
             } else if (sendBle(t)) {
                 input.setText("");
+            }
+        });
+
+        // Petit écran / clavier ouvert : on masque la carte et le micro pour garder la place aux messages
+        root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+            Rect r = new Rect();
+            root.getWindowVisibleDisplayFrame(r);
+            int total = root.getRootView().getHeight();
+            int vis = (total - r.bottom > total * 0.15) ? View.GONE : View.VISIBLE;
+            if (mic.getVisibility() != vis) {
+                mic.setVisibility(vis);
+                card.setVisibility(vis);
             }
         });
 
@@ -608,28 +650,90 @@ public class MainActivity extends Activity {
 
     // ---------------- Paramètres ----------------
 
+    TextView sectionTitle(String t) {
+        TextView v = new TextView(this);
+        v.setText(t);
+        v.setTextColor(C_GREEN);
+        v.setTextSize(11);
+        v.setTypeface(null, Typeface.BOLD);
+        v.setPadding(0, dp(14), 0, dp(4));
+        return v;
+    }
+
+    View settingRow(String title, String desc, final Runnable act, final AlertDialog[] dlg) {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.VERTICAL);
+        r.setPadding(dp(12), dp(10), dp(12), dp(10));
+        r.setBackground(rounded(C_CARD, 12, C_STROKE));
+        TextView a = new TextView(this);
+        a.setText(title);
+        a.setTextColor(C_TEXT);
+        a.setTextSize(15);
+        TextView b = new TextView(this);
+        b.setText(desc);
+        b.setTextColor(C_MUTED);
+        b.setTextSize(12);
+        r.addView(a);
+        r.addView(b);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(6);
+        r.setLayoutParams(lp);
+        r.setOnClickListener(v -> {
+            if (dlg[0] != null) dlg[0].dismiss();
+            act.run();
+        });
+        return r;
+    }
+
     void openSettings() {
-        final String[] items = {
-                "Changer mon nom",
-                "Envoyer une annonce (administrateur)",
-                "Relancer le Bluetooth",
-                "Rechercher une mise à jour",
-                "Effacer l'historique des messages",
-                "À propos"};
-        new AlertDialog.Builder(this)
-                .setTitle("Paramètres")
-                .setItems(items, (dlg, i) -> {
-                    if (i == 0) askName(false);
-                    else if (i == 1) askAdmin();
-                    else if (i == 2) {
-                        stopBleScan();
-                        ensureBle();
-                    } else if (i == 3) checkUpdate(true);
-                    else if (i == 4) confirmClear();
-                    else showAbout();
-                })
-                .setNegativeButton("Fermer", null)
-                .show();
+        final AlertDialog[] dlg = new AlertDialog[1];
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(4), dp(16), dp(8));
+
+        box.addView(sectionTitle("PROFIL"));
+        box.addView(settingRow("Mon nom", "Affiché devant tes messages.", () -> askName(false), dlg));
+
+        box.addView(sectionTitle("CONNEXION"));
+        box.addView(settingRow("Messages envoyés par : " + (mode == 0 ? "Wi-Fi" : "Bluetooth"),
+                "Touche pour changer. La voix utilise toujours le Wi-Fi.", () -> setMode(1 - mode), dlg));
+        box.addView(settingRow("Relancer le Bluetooth",
+                "À faire après avoir allumé le Bluetooth.", () -> {
+                    stopBleScan();
+                    ensureBle();
+                }, dlg));
+
+        box.addView(sectionTitle("ADMINISTRATION"));
+        box.addView(settingRow("Envoyer une annonce",
+                "Réservé à l'administrateur, avec son code.", () -> askAdmin(), dlg));
+
+        box.addView(sectionTitle("APPLICATION"));
+        box.addView(settingRow("Rechercher une mise à jour",
+                "Demande internet. Les messages, eux, n'en ont pas besoin.", () -> checkUpdate(true), dlg));
+        box.addView(settingRow("Effacer l'historique",
+                "Supprime les messages affichés sur ce téléphone.", () -> confirmClear(), dlg));
+        box.addView(settingRow("À propos", "Version et fonctionnement.", () -> showAbout(), dlg));
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        TextView ttl = new TextView(this);
+        ttl.setText("Paramètres");
+        ttl.setTextColor(C_TEXT);
+        ttl.setTextSize(20);
+        ttl.setTypeface(null, Typeface.BOLD);
+        ttl.setPadding(dp(20), dp(18), dp(20), dp(4));
+
+        AlertDialog d = new AlertDialog.Builder(this)
+                .setCustomTitle(ttl)
+                .setView(sv)
+                .setNegativeButton("Retour", null)
+                .create();
+        dlg[0] = d;
+        d.show();
+        d.getWindow().setBackgroundDrawable(rounded(C_BG, 16, C_STROKE));
+        d.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(C_GREEN);
     }
 
     void confirmClear() {
@@ -675,6 +779,12 @@ public class MainActivity extends Activity {
                 w.setPadding(dp(24), dp(24), dp(24), dp(24));
                 msgBox.addView(w);
             }
+            if (shown > lastCount && lastCount >= 0 && msgBox.getChildCount() > 0) {
+                View lastView = msgBox.getChildAt(msgBox.getChildCount() - 1);
+                lastView.setAlpha(0f);
+                lastView.animate().alpha(1f).setDuration(180).start();
+            }
+            lastCount = shown;
             scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
         });
     }
@@ -695,9 +805,14 @@ public class MainActivity extends Activity {
     }
 
     GradientDrawable rounded(int color, float radiusDp) {
+        return rounded(color, radiusDp, 0);
+    }
+
+    GradientDrawable rounded(int color, float radiusDp, int stroke) {
         GradientDrawable g = new GradientDrawable();
         g.setColor(color);
         g.setCornerRadius(radiusDp * density);
+        if (stroke != 0) g.setStroke(Math.max(1, dp(1)), stroke);
         return g;
     }
 
@@ -721,7 +836,8 @@ public class MainActivity extends Activity {
     }
 
     int colorFor(String t) {
-        if (t.startsWith("Prêt")) return C_GREEN;
+        if (t.startsWith("Prêt") || t.startsWith("Message") || t.startsWith("Diffusion")) return C_GREEN;
+        if (t.startsWith("Échec")) return C_RED;
         if (t.startsWith("Connexion interrompue") || t.startsWith("Microphone")) return C_AMBER;
         if (t.startsWith("Transmission")) return C_RED;
         if (t.startsWith("Quelqu")) return C_BLUE;
@@ -754,18 +870,54 @@ public class MainActivity extends Activity {
         if (connWifi == null || status == null) return;
         boolean wifi = !broadcasts().isEmpty();
         long now = System.currentTimeMillis();
+        if (wifi && wifiSince == 0) wifiSince = now;
+        if (!wifi) wifiSince = 0;
         int wp = countPeers(wifiPeers, now, 20000);
         int bp = countPeers(btPeers, now, 120000);
-        connWifi.setText((wifi ? "Wi-Fi : connecté" : "Wi-Fi : non connecté")
-                + "  ·  appareils à portée : " + wp);
-        connWifi.setTextColor(wifi ? C_TEXT : C_AMBER);
-        connBt.setText(bleState + "  ·  entendus récemment : " + bp);
-        connBt.setTextColor(bleState.contains("prêt") ? C_TEXT : C_AMBER);
+        boolean searching = wifi && wp == 0 && now - wifiSince < 15000;
+
+        String ws;
+        int wc;
+        if (!wifi) {
+            ws = "Wi-Fi : non connecté";
+            wc = C_AMBER;
+        } else if (wp > 0) {
+            ws = "Wi-Fi : connecté  ·  " + wp + (wp > 1 ? " appareils" : " appareil") + " à portée";
+            wc = C_GREEN;
+        } else if (searching) {
+            ws = "Wi-Fi : recherche d'appareils…";
+            wc = C_TEXT;
+        } else {
+            ws = "Wi-Fi : aucun appareil trouvé";
+            wc = C_AMBER;
+        }
+        connWifi.setText(ws);
+        connWifi.setTextColor(wc);
+
+        boolean bleOk = bleState.contains("prêt");
+        connBt.setText(bleOk
+                ? bleState + (bp > 0 ? "  ·  " + bp + (bp > 1 ? " appareils entendus" : " appareil entendu")
+                : "  ·  en écoute, aucun appareil entendu")
+                : bleState);
+        connBt.setTextColor(!bleOk ? C_AMBER : (bp > 0 ? C_GREEN : C_TEXT));
+
         styleChip(chipWifi, mode == 0);
         styleChip(chipBt, mode == 1);
-        modeHint.setText(mode == 0
-                ? "Les messages partent par Wi-Fi. La voix utilise toujours le Wi-Fi."
-                : "Les messages partent par Bluetooth (courts, 160 octets max). La voix utilise toujours le Wi-Fi.");
+
+        String help;
+        if (mode == 0) {
+            if (!wifi) help = "Connecte-toi à un Wi-Fi, ou active le partage de connexion sur l'un des deux téléphones.";
+            else if (wp == 0 && !searching) help = "Vérifie que l'autre téléphone a Toki Walkie ouvert et qu'il est sur le même Wi-Fi.";
+            else help = "Wi-Fi : voix et messages entre appareils sur le même réseau.";
+        } else {
+            if (!bleOk) help = "Allume le Bluetooth, puis Paramètres > Relancer le Bluetooth.";
+            else if (bp == 0) help = "Rapproche les téléphones et vérifie le Bluetooth des deux côtés. Un appareil n'est compté qu'après un message reçu.";
+            else help = "Bluetooth : messages courts (160 octets max), sans réseau. La voix reste sur le Wi-Fi.";
+        }
+        modeHint.setText(help);
+
+        if (btn.mode == 0 || btn.mode == 3) btn.setMode(!wifi || micDenied ? 3 : 0);
+
         if (!talking && !busy) {
             String cur = status.getText().toString();
             if (wifi) {
@@ -774,6 +926,35 @@ public class MainActivity extends Activity {
                 setState(STATE_DOWN);
             }
         }
+    }
+
+    void updateSendEnabled() {
+        if (sendBtn == null) return;
+        boolean on = !input.getText().toString().trim().isEmpty();
+        sendBtn.setEnabled(on);
+        sendBtn.setBackground(rounded(on ? C_GREEN : 0xFF1E293B, 22));
+        sendBtn.setTextColor(on ? C_BG : C_MUTED);
+    }
+
+    // Affiche un état quelques secondes, puis revient à « Prêt »
+    void flash(final String t) {
+        runOnUiThread(() -> {
+            setState(t);
+            handler.postDelayed(() -> {
+                if (status.getText().toString().equals(t)) setState(STATE_READY);
+            }, 2500);
+        });
+    }
+
+    void showMicHelp() {
+        new AlertDialog.Builder(this)
+                .setTitle("Microphone non autorisé")
+                .setMessage("Toki Walkie a besoin du micro pour envoyer ta voix. Ouvre les réglages du téléphone, touche Autorisations, puis autorise le Microphone.")
+                .setPositiveButton("Ouvrir les réglages", (dlg, w) -> startActivity(new Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName()))))
+                .setNegativeButton("Plus tard", null)
+                .show();
     }
 
     // Petit signal de présence en Wi-Fi (5 octets) pour compter les appareils à portée
@@ -801,6 +982,12 @@ public class MainActivity extends Activity {
             time = line.substring(0, tp);
             line = line.substring(tp + 1);
         }
+        String state = "";
+        int sp = line.lastIndexOf('\u0005');
+        if (sp >= 0) {
+            state = line.substring(sp + 1);
+            line = line.substring(0, sp);
+        }
         boolean mine = line.startsWith("Moi (");
         boolean ad = line.startsWith("ANNONCE de ") || line.startsWith("Moi (annonce");
         int sep = line.indexOf(" : ");
@@ -817,18 +1004,24 @@ public class MainActivity extends Activity {
             who2 = "Quelqu'un";
         }
         if (who2.isEmpty()) who2 = "Message";
+        boolean voice = chan.startsWith("voix");
+        String type = chan.isEmpty() ? "" : chan.substring(0, 1).toUpperCase() + chan.substring(1);
+        if (ad && mine) type = "Annonce";
+        boolean fail = state.equals("Échec");
         String cap = (mine ? "Moi" : who2)
-                + (chan.isEmpty() ? "" : "  ·  " + chan)
-                + (time.isEmpty() ? "" : "  ·  " + time);
+                + (type.isEmpty() ? "" : "  ·  " + type)
+                + (time.isEmpty() ? "" : "  ·  " + time)
+                + (state.isEmpty() ? "" : "  ·  " + state);
 
+        int bg = ad ? 0xFF78350F : (voice ? 0xFF1E3A5F : (mine ? 0xFF166534 : C_CARD));
         LinearLayout bx = new LinearLayout(this);
         bx.setOrientation(LinearLayout.VERTICAL);
         bx.setPadding(dp(12), dp(8), dp(12), dp(8));
-        bx.setBackground(rounded(ad ? 0xFF78350F : (mine ? 0xFF166534 : C_CARD), 14));
+        bx.setBackground(rounded(bg, 14, (!ad && !voice && !mine) ? C_STROKE : 0));
         TextView c = new TextView(this);
         c.setText(cap);
         c.setTextSize(11);
-        c.setTextColor(ad ? 0xFFFCD34D : (mine ? 0xFFBBF7D0 : C_MUTED));
+        c.setTextColor(fail ? 0xFFFCA5A5 : (ad ? 0xFFFCD34D : (mine ? 0xFFBBF7D0 : C_MUTED)));
         TextView t = new TextView(this);
         t.setText(text);
         t.setTextSize(15);
@@ -838,7 +1031,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.gravity = mine ? Gravity.END : Gravity.START;
-        lp.setMargins(mine ? dp(40) : 0, dp(4), mine ? 0 : dp(40), dp(4));
+        lp.setMargins(mine ? dp(40) : 0, dp(5), mine ? 0 : dp(40), dp(5));
         bx.setLayoutParams(lp);
         return bx;
     }
@@ -878,7 +1071,9 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(code, perms, res);
         if (code == 1) {
             boolean ok = res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED;
+            micDenied = !ok;
             setState(ok ? STATE_READY : "Microphone non autorisé");
+            if (!ok) showMicHelp();
         }
         if (code == 3) {
             if (hasBlePerms()) startBleScan();
@@ -906,10 +1101,27 @@ public class MainActivity extends Activity {
 
     final AdvertiseCallback legacyCb = new AdvertiseCallback() {
         @Override
+        public void onStartSuccess(AdvertiseSettings st) {
+            finishBle(true);
+        }
+
+        @Override
         public void onStartFailure(int err) {
-            ui("Échec de l'envoi Bluetooth (mode normal, code " + err + ")");
+            finishBle(false);
         }
     };
+
+    // Fin du démarrage de l'envoi Bluetooth : Envoyé (diffusion lancée) ou Échec. La réception n'est pas confirmée.
+    void finishBle(boolean ok) {
+        String sh;
+        synchronized (pendLock) {
+            if (pendShown == null) return;
+            sh = pendShown;
+            pendShown = null;
+        }
+        addMsg(sh + "\u0005" + (ok ? "Envoyé" : "Échec"));
+        ui(ok ? "Diffusion Bluetooth lancée" : "Échec de l'envoi Bluetooth");
+    }
 
     @TargetApi(26)
     boolean codedSupported(BluetoothAdapter ad) {
@@ -1087,8 +1299,11 @@ public class MainActivity extends Activity {
             status.setText("Erreur d'envoi Bluetooth");
             return false;
         }
-        addMsg(shown);
-        status.setText("Envoi Bluetooth en cours…");
+        synchronized (pendLock) {
+            pendShown = shown;
+        }
+        setState("Envoi Bluetooth en cours…");
+        handler.postDelayed(() -> finishBle(false), 3000);
         return true;
     }
 
@@ -1130,9 +1345,7 @@ public class MainActivity extends Activity {
         final AdvertisingSetCallback cb = new AdvertisingSetCallback() {
             @Override
             public void onAdvertisingSetStarted(AdvertisingSet set, int txPower, int st) {
-                if (st != AdvertisingSetCallback.ADVERTISE_SUCCESS) {
-                    ui("Échec de l'envoi longue portée (code " + st + ")");
-                }
+                if (st == AdvertisingSetCallback.ADVERTISE_SUCCESS) finishBle(true);
             }
         };
         advCb = cb;
@@ -1187,7 +1400,12 @@ public class MainActivity extends Activity {
                     // ignoré
                 }
                 if (k[0] >= steps) {
-                    ui("Envoi Bluetooth terminé");
+                    runOnUiThread(() -> {
+                        String cur = status.getText().toString();
+                        if (cur.startsWith("Diffusion Bluetooth") || cur.startsWith("Envoi Bluetooth")) {
+                            flash("Diffusion Bluetooth terminée");
+                        }
+                    });
                     return;
                 }
                 AdvertiseData data = new AdvertiseData.Builder()
@@ -1212,10 +1430,17 @@ public class MainActivity extends Activity {
 
     void startTalk() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
-            setState("Microphone non autorisé");
+            if (prefs.getBoolean("micAsked", false)) {
+                micDenied = true;
+                setState("Microphone non autorisé");
+                showMicHelp();
+            } else {
+                prefs.edit().putBoolean("micAsked", true).apply();
+                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            }
             return;
         }
+        micDenied = false;
         if (busy || sock == null) return;
         if (broadcasts().isEmpty()) {
             setState(STATE_DOWN);
@@ -1252,30 +1477,44 @@ public class MainActivity extends Activity {
         sendWifiRaw(fullText(t));
     }
 
-    void sendWifiRaw(final String raw) {
+    // Message texte Wi-Fi avec retour réel : Envoyé si au moins un paquet est parti, sinon Échec
+    void sendTextMsg(final String t) {
+        final String raw = fullText(t);
+        setState("Envoi en cours…");
         new Thread(() -> {
-            if (sock == null) {
-                ui("Pas encore connecté");
-                return;
-            }
-            byte[] txt = raw.getBytes(StandardCharsets.UTF_8);
-            byte[] buf = new byte[H + txt.length];
-            ByteBuffer.wrap(buf).putInt(myId);
-            buf[4] = T_TEXT;
-            System.arraycopy(txt, 0, buf, H, txt.length);
-            for (InetAddress a : broadcasts()) {
-                try {
-                    sock.send(new DatagramPacket(buf, buf.length, a, PORT));
-                } catch (Exception e) {
-                    // ignoré
-                }
-            }
+            boolean ok = sendWifiPackets(raw);
+            addMsg("Moi (Wi-Fi) : " + t + "\u0005" + (ok ? "Envoyé" : "Échec"));
+            flash(ok ? "Message envoyé par Wi-Fi" : "Échec : aucun réseau Wi-Fi disponible");
         }).start();
+    }
+
+    boolean sendWifiPackets(String raw) {
+        if (sock == null) return false;
+        byte[] txt = raw.getBytes(StandardCharsets.UTF_8);
+        byte[] buf = new byte[H + txt.length];
+        ByteBuffer.wrap(buf).putInt(myId);
+        buf[4] = T_TEXT;
+        System.arraycopy(txt, 0, buf, H, txt.length);
+        boolean ok = false;
+        for (InetAddress a : broadcasts()) {
+            try {
+                sock.send(new DatagramPacket(buf, buf.length, a, PORT));
+                ok = true;
+            } catch (Exception e) {
+                // ignoré
+            }
+        }
+        return ok;
+    }
+
+    void sendWifiRaw(final String raw) {
+        new Thread(() -> sendWifiPackets(raw)).start();
     }
 
     void sendLoop() {
         AudioRecord rec = null;
-        boolean err = false;
+        boolean err = false, sentOk = false;
+        long t0 = 0;
         try {
             int min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
             rec = new AudioRecord(MediaRecorder.AudioSource.MIC, RATE,
@@ -1290,6 +1529,7 @@ public class MainActivity extends Activity {
             buf[4] = T_AUDIO;
             List<InetAddress> targets = broadcasts();
             rec.startRecording();
+            t0 = System.currentTimeMillis();
             if (talking) {
                 // le micro enregistre réellement : on l'affiche
                 runOnUiThread(() -> btn.setMode(1));
@@ -1301,6 +1541,7 @@ public class MainActivity extends Activity {
                 for (InetAddress a : targets) {
                     try {
                         sock.send(new DatagramPacket(buf, H + n, a, PORT));
+                        sentOk = true;
                     } catch (Exception e) {
                         // ignoré
                     }
@@ -1315,7 +1556,16 @@ public class MainActivity extends Activity {
             busy = false;
             runOnUiThread(() -> btn.setMode(0));
         }
-        if (!err) ui(STATE_READY);
+        if (!err) {
+            long ms = t0 == 0 ? 0 : System.currentTimeMillis() - t0;
+            if (ms >= 400) {
+                long secs = Math.max(1, (ms + 500) / 1000);
+                addMsg("Moi (voix Wi-Fi) : Message vocal · " + secs + " s\u0005" + (sentOk ? "Envoyé" : "Échec"));
+                flash(sentOk ? "Message vocal envoyé" : "Échec de l'envoi vocal");
+            } else {
+                ui(STATE_READY);
+            }
+        }
     }
 
     void recvLoop() {
@@ -1340,6 +1590,7 @@ public class MainActivity extends Activity {
 
         byte[] buf = new byte[2048];
         boolean receiving = false;
+        long recvStart = 0;
         while (running) {
             try {
                 DatagramPacket p = new DatagramPacket(buf, buf.length);
@@ -1360,6 +1611,7 @@ public class MainActivity extends Activity {
                     track.write(buf, H, len - H);
                     if (!receiving) {
                         receiving = true;
+                        recvStart = System.currentTimeMillis();
                         ui("Quelqu’un parle…");
                         runOnUiThread(() -> {
                             if (!talking) btn.setMode(2);
@@ -1369,6 +1621,8 @@ public class MainActivity extends Activity {
             } catch (SocketTimeoutException e) {
                 if (receiving) {
                     receiving = false;
+                    long secs = Math.max(1, (System.currentTimeMillis() - recvStart + 500) / 1000);
+                    addMsg("Quelqu'un (voix Wi-Fi) : Message vocal reçu · " + secs + " s");
                     ui(talking ? "Transmission en cours…" : STATE_READY);
                     runOnUiThread(() -> btn.setMode(talking ? 1 : 0));
                 }
